@@ -1,0 +1,401 @@
+---
+title: "arabidopsis intron gff generation"
+output: rmarkdown::html_vignette
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, echo = FALSE, message = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+library(tidyverse)
+```
+
+# 利用bioconductor数据库建立内含子GRanges和GFF文件
+由于在count summary的时候需要使用unique intron的注释文件，这里利用bioconductor的相关包制作相应的注释文件，并去重（保留最小的isoform来源的intron）
+```{r}
+library(GenomicFeatures)
+library(BSgenome)
+library(BSgenome.Athaliana.TAIR.TAIR9)
+```
+## 流程
+-   intronByTranscript获得intron的GRangesList
+-   unlist获得GRanges
+-   转换为数据框，添加intron_id,intron_name,intron_rank等列
+-   转换为GRanges对象
+-   制作注释文件
+```{r}
+genome <- BSgenome.Athaliana.TAIR.TAIR9 # 载入参考基因组
+seqnames(genome) <- c("1", "2", "3", "4", "5", "Mt", "Pt") # 重新赋值ID（转换ID）
+txdb_ensemble47 <- "/home/zhangy/ref_files/TxDb.Arabidopsis_thaliana.TAIR10.47.sqlite"
+arab <- loadDb(txdb_ensemble47) # 载入注释信息
+```
+## total intron GRanges
+```{r}
+intron_arab <- intronsByTranscript(arab, use.names = T) %>%
+  unlist() %>% # 如何去除子集为0的GRanges？ unlist()并重新split()
+  GenomicRanges::split(names(.))
+tmp1 <- intron_arab %>%
+  unlist() %>%
+  names() %>%
+  str_replace_all("(.*)\\.\\1", "\\1")
+intron_arab %>%
+  unlist() %>%
+  as_tibble() %>%
+  mutate(Isoform_ID = tmp1) %>% # 添加辅助列
+  group_by(Isoform_ID) %>%
+  mutate(intron_id = as.integer(if_else(strand == "+", 1:n(), n():1))) %>% # 添加metacolumn信息
+  ungroup() %>%
+  mutate(
+    intron_name = str_c(Isoform_ID, "intron", intron_id),
+    intron_rank = intron_id
+  ) %>% # 添加metacolumn信息
+  dplyr::select(
+    seqnames, start, end, width, strand,
+    intron_id, intron_name, intron_rank, Isoform_ID
+  ) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+  GenomicRanges::split(.$Isoform_ID) %>%
+  write_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.GrList.rds")
+```
+## unique intron GRanges
+GrList根据起止位点去重（这一步非常重要！！！）
+-   UID
+-   只留最小isoform，解决一个UID对应多个isoform的情况
+-   一个UID对应多个gene的时候，均留下
+```{r}
+all_intron <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.GrList.rds"
+read_rds(all_intron) %>%
+  unlist() %>%
+  as_tibble() %>%
+  mutate(
+    Gene_ID = str_sub(Isoform_ID, 1, 9),
+    # 注意将Isoform_N转换为数值型
+    Isoform_N = as.integer(str_replace(Isoform_ID, "\\w+\\.(\\d+)", "\\1")),
+    UID = str_c(seqnames, start, end, strand, sep = "_")
+  ) %>%
+  group_by(Gene_ID, UID) %>% # 这个分组思路很重要！
+  mutate(
+    n = n(),
+    is_minisonum = if_else(Isoform_N == min(Isoform_N), "Y", "N")
+  ) %>%
+  ungroup() %>%
+  mutate(ok = case_when(
+    n == 1 ~ "Yes",
+    n > 1 & is_minisonum == "Y" ~ "Yes",
+    T ~ "No"
+  )) %>%
+  filter(ok == "Yes") %>% # 132,674 rows
+  # pull(UID) %>% duplicated() %>% sum()/2   #其中有74个起止位点对应2个基因！！！
+  dplyr::select(seqnames, start, end, width, strand, intron_id, intron_name, intron_rank, Isoform_ID) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+  GenomicRanges::split(.$Isoform_ID) %>%
+  write_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.unique.GrList.rds")
+```
+## 制作注释文件
+* 未去重
+```{r}
+all_intron_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.GrList.rds"
+read_rds(all_intron_gr) %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::rename(
+    Chr = seqnames,
+    Start = start,
+    End = end,
+    Strand = strand
+  ) %>%
+  mutate(
+    source = "araport11",
+    Type = "intron",
+    score = ".",
+    phase = "."
+  ) %>%
+  mutate(attributes = str_c(
+    "Parent=transcript:", Isoform_ID, ";",
+    "Name=", intron_name, ";",
+    "rank=", intron_rank, ";",
+    "length=", width
+  )) %>%
+  dplyr::select(Chr, source, Type, Start, End, score, Strand, phase, attributes) %>%
+  mutate(
+    Chr = as.character(Chr),
+    Strand = as.character(Strand)
+  ) %>%
+  write_tsv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron.gff3", col_names = F)
+```
+* 去重
+```{r}
+unique_intron_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.unique.GrList.rds"
+read_rds(unique_intron_gr) %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::rename(
+    Chr = seqnames,
+    Start = start,
+    End = end,
+    Strand = strand
+  ) %>%
+  mutate(
+    source = "araport11",
+    Type = "intron",
+    score = ".",
+    phase = "."
+  ) %>%
+  mutate(attributes = str_c(
+    "Parent=transcript:", Isoform_ID, ";",
+    "Name=", intron_name, ";",
+    "rank=", intron_rank, ";",
+    "length=", width
+  )) %>%
+  dplyr::select(Chr, source, Type, Start, End, score, Strand, phase, attributes) %>%
+  mutate(
+    Chr = as.character(Chr),
+    Strand = as.character(Strand)
+  ) %>%
+  write_tsv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron.unique.gff3", col_names = F)
+```
+## 制作csv文件
+* 未去重
+```{r}
+all_intron_gff <- "/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron.gff3"
+read_tsv(all_intron_gff, col_names = F) %>%
+  set_names(c("Chr", "source", "Type", "Start", "End", "score", "Strand", "phase", "attributes")) %>%
+  mutate(Intron_ID = str_extract(attributes, "(?<=Name=).*?(?=;)"), .before = Chr) %>%
+  mutate(Intron_UID = str_c(Chr, Start, End, Strand, sep = "_"), .after = Intron_ID) %>%
+  mutate(Gene_ID = str_sub(Intron_ID, 1, 9), .after = Intron_UID) %>%
+  mutate(Isoform_ID = str_replace(Intron_ID, "(.*)intron.*", "\\1"), .after = Gene_ID) %>%
+  mutate(Length = End - Start + 1, .after = Strand) %>%
+  mutate(Intron_rank = as.integer(str_replace(Intron_ID, ".*intron(\\d+)", "\\1")), .after = Isoform_ID) %>%
+  add_count(Isoform_ID, name = "n_intron") %>%
+  relocate(n_intron, .after = Intron_rank) %>%
+  mutate(n_intron100 = if_else(Length >= 100, 1, 0)) %>%
+  group_by(Isoform_ID) %>%
+  mutate(n_intron100 = sum(n_intron100)) %>%
+  ungroup() %>%
+  relocate(n_intron100, .after = n_intron) %>%
+  dplyr::select(-c(source, Type, score, phase)) %>%
+  write_csv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron.csv")
+```
+* 去重
+```{r}
+unique_intron_gff <- "/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron.unique.gff3"
+read_tsv(unique_intron_gff, col_names = F) %>%
+  set_names(c("Chr", "source", "Type", "Start", "End", "score", "Strand", "phase", "attributes")) %>%
+  mutate(Intron_ID = str_extract(attributes, "(?<=Name=).*?(?=;)"), .before = Chr) %>%
+  mutate(Intron_UID = str_c(Chr, Start, End, Strand, sep = "_"), .after = Intron_ID) %>%
+  mutate(Gene_ID = str_sub(Intron_ID, 1, 9), .after = Intron_UID) %>%
+  mutate(Isoform_ID = str_replace(Intron_ID, "(.*)intron.*", "\\1"), .after = Gene_ID) %>%
+  mutate(Length = End - Start + 1, .after = Strand) %>%
+  mutate(Intron_rank = as.integer(str_replace(Intron_ID, ".*intron(\\d+)", "\\1")), .after = Isoform_ID) %>%
+  add_count(Isoform_ID, name = "n_intron") %>%
+  relocate(n_intron, .after = Intron_rank) %>%
+  dplyr::select(-c(source, Type, score, phase)) %>%
+  write_csv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron.unique.csv")
+```
+# intron分段生成lariat region和tail region的intron注释文件
+```{r}
+library(GenomicFeatures)
+library(BSgenome)
+library(BSgenome.Athaliana.TAIR.TAIR9)
+```
+## tail and lariat GRanges
+* 未去重
+```{r}
+all_intron_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.GrList.rds"
+read_rds(all_intron_gr) %>%
+  .[width(.) > 27] %>% # 筛选！
+  resize(27, fix = "end", use.names = T, ignore.strand = F) %>%
+  write_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_tail27.GrList.rds")
+
+tmp1 <- read_rds(all_intron_gr) %>%
+  .[width(.) > 27]
+tmp2 <- read_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_tail27.GrList.rds")
+tmp3 <- tmp1 %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::select(6:9) # 提取meta column
+GenomicRanges::setdiff(tmp1, tmp2, ignore.strand = F) %>%
+  as_tibble() %>%
+  bind_cols(tmp3) %>%
+  GenomicRanges::makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+  GenomicRanges::split(.$Isoform_ID) %>%
+  write_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_lariat_region.GrList.rds")
+```
+* 去重
+```{r}
+unique_intron_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron.unique.GrList.rds"
+read_rds(unique_intron_gr) %>%
+  .[width(.) > 27] %>%
+  resize(27, fix = "end", use.names = T, ignore.strand = F) %>%
+  write_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_tail27.unique.GrList.rds")
+
+tmp1 <- read_rds(unique_intron_gr) %>%
+  .[width(.) > 27]
+tmp2 <- read_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_tail27.unique.GrList.rds")
+tmp3 <- tmp1 %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::select(6:9)
+GenomicRanges::setdiff(tmp1, tmp2, ignore.strand = F) %>%
+  as_tibble() %>%
+  bind_cols(tmp3) %>%
+  GenomicRanges::makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+  GenomicRanges::split(.$Isoform_ID) %>%
+  write_rds("/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_lariat_region.unique.GrList.rds")
+```
+## 制作注释文件
+* 未去重
+```{r}
+all_lariat_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_lariat_region.GrList.rds"
+all_tail_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_tail27.GrList.rds"
+# lariat region
+read_rds(all_lariat_gr) %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::rename(
+    Chr = seqnames,
+    Start = start,
+    End = end,
+    Strand = strand
+  ) %>%
+  mutate(
+    source = "araport11",
+    Type = "intron",
+    score = ".",
+    phase = "."
+  ) %>%
+  mutate(attributes = str_c(
+    "Parent=transcript:", Isoform_ID, ";",
+    "Name=", intron_name, ";",
+    "rank=", intron_rank, ";",
+    "length=", width
+  )) %>%
+  dplyr::select(Chr, source, Type, Start, End, score, Strand, phase, attributes) %>%
+  mutate(
+    Chr = as.character(Chr),
+    Strand = as.character(Strand)
+  ) %>%
+  write_tsv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron_lariat_region.gff3", col_names = F)
+# tail region
+read_rds(all_tail_gr) %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::rename(
+    Chr = seqnames,
+    Start = start,
+    End = end,
+    Strand = strand
+  ) %>%
+  mutate(
+    source = "araport11",
+    Type = "intron",
+    score = ".",
+    phase = "."
+  ) %>%
+  mutate(attributes = str_c(
+    "Parent=transcript:", Isoform_ID, ";",
+    "Name=", intron_name, ";",
+    "rank=", intron_rank, ";",
+    "length=", width
+  )) %>%
+  dplyr::select(Chr, source, Type, Start, End, score, Strand, phase, attributes) %>%
+  mutate(
+    Chr = as.character(Chr),
+    Strand = as.character(Strand)
+  ) %>%
+  write_tsv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron_tail27.gff3", col_names = F)
+```
+* 去重
+```{r}
+unique_lariat_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_lariat_region.unique.GrList.rds"
+unique_tail_gr <- "/home/zhangy/ref_files/ZYO_Arabidopsis_thaliana.TAIR10.47.intron_tail27.unique.GrList.rds"
+# lariat region
+read_rds(unique_lariat_gr) %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::rename(
+    Chr = seqnames,
+    Start = start,
+    End = end,
+    Strand = strand
+  ) %>%
+  mutate(
+    source = "araport11",
+    Type = "intron",
+    score = ".",
+    phase = "."
+  ) %>%
+  mutate(attributes = str_c(
+    "Parent=transcript:", Isoform_ID, ";",
+    "Name=", intron_name, ";",
+    "rank=", intron_rank, ";",
+    "length=", width
+  )) %>%
+  dplyr::select(Chr, source, Type, Start, End, score, Strand, phase, attributes) %>%
+  mutate(
+    Chr = as.character(Chr),
+    Strand = as.character(Strand)
+  ) %>%
+  write_tsv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron_lariat_region.unique.gff3", col_names = F)
+# tail region
+read_rds(unique_tail_gr) %>%
+  unlist() %>%
+  as_tibble() %>%
+  dplyr::rename(
+    Chr = seqnames,
+    Start = start,
+    End = end,
+    Strand = strand
+  ) %>%
+  mutate(
+    source = "araport11",
+    Type = "intron",
+    score = ".",
+    phase = "."
+  ) %>%
+  mutate(attributes = str_c(
+    "Parent=transcript:", Isoform_ID, ";",
+    "Name=", intron_name, ";",
+    "rank=", intron_rank, ";",
+    "length=", width
+  )) %>%
+  dplyr::select(Chr, source, Type, Start, End, score, Strand, phase, attributes) %>%
+  mutate(
+    Chr = as.character(Chr),
+    Strand = as.character(Strand)
+  ) %>%
+  write_tsv("/home/zhangy/ref_files/ZYO_GR_Ensemble47.intron_tail27.unique.gff3", col_names = F)
+```
+## 制作csv文件
+* 去重实际分段lariat region
+```{r}
+unique_lariat_region_gff <- "/home/zhangy/ref_files/ZXT_Ensemble47.intron_realsplit_lariat_region.unique.gff3"
+read_tsv(unique_lariat_region_gff, col_names = F) %>%
+  set_names(c("Chr", "source", "Type", "Start", "End", "score", "Strand", "phase", "attributes")) %>%
+  mutate(Intron_ID = str_extract(attributes, "(?<=Name=).*?(?=;)"), .before = Chr) %>%
+  mutate(Intron_UID = str_c(Chr, Start, End, Strand, sep = "_"), .after = Intron_ID) %>%
+  mutate(Gene_ID = str_sub(Intron_ID, 1, 9), .after = Intron_UID) %>%
+  mutate(Isoform_ID = str_replace(Intron_ID, "(.*)intron.*", "\\1"), .after = Gene_ID) %>%
+  mutate(Length = End - Start + 1, .after = Strand) %>%
+  mutate(Intron_rank = as.integer(str_replace(Intron_ID, ".*intron(\\d+)", "\\1")), .after = Isoform_ID) %>%
+  add_count(Isoform_ID, name = "n_intron") %>%
+  relocate(n_intron, .after = Intron_rank) %>%
+  dplyr::select(-c(source, Type, score, phase)) %>%
+  write_csv("/home/zhangy/ref_files/ZXT_Ensemble47.intron_realsplit_lariat_region.unique.csv")
+```
+* 去重实际分段tail region
+```{r}
+unique_tail_region_gff <- "/home/zhangy/ref_files/ZXT_Ensemble47.intron_realsplit_tail_region.unique.gff3"
+read_tsv(unique_tail_region_gff, col_names = F) %>%
+  set_names(c("Chr", "source", "Type", "Start", "End", "score", "Strand", "phase", "attributes")) %>%
+  mutate(Intron_ID = str_extract(attributes, "(?<=Name=).*?(?=;)"), .before = Chr) %>%
+  mutate(Intron_UID = str_c(Chr, Start, End, Strand, sep = "_"), .after = Intron_ID) %>%
+  mutate(Gene_ID = str_sub(Intron_ID, 1, 9), .after = Intron_UID) %>%
+  mutate(Isoform_ID = str_replace(Intron_ID, "(.*)intron.*", "\\1"), .after = Gene_ID) %>%
+  mutate(Length = End - Start + 1, .after = Strand) %>%
+  mutate(Intron_rank = as.integer(str_replace(Intron_ID, ".*intron(\\d+)", "\\1")), .after = Isoform_ID) %>%
+  add_count(Isoform_ID, name = "n_intron") %>%
+  relocate(n_intron, .after = Intron_rank) %>%
+  dplyr::select(-c(source, Type, score, phase)) %>%
+  write_csv("/home/zhangy/ref_files/ZXT_Ensemble47.intron_realsplit_tail_region.unique.csv")
+```
